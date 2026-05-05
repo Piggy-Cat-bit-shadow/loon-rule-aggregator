@@ -42,18 +42,12 @@ class Rule:
 
     @property
     def structural_key(self) -> Tuple[str, str, str, Tuple[str, ...]]:
-        """
-        结构去重 key。
-
-        优化点：
-        1. REJECT / REJECT-DROP / REJECT-NO-DROP 统一视为 REJECT 类；
-        2. REJECT 类规则去重时忽略 no-resolve 等尾部参数；
-        3. DOMAIN / DOMAIN-SUFFIX / IP-CIDR 目标做规范化。
-        """
         kind = self.kind.upper()
         policy = normalize_policy(self.policy)
         target = normalize_target_by_kind(kind, self.target)
 
+        # 广告拦截规则里，REJECT / REJECT-DROP / REJECT-NO-DROP 视为同一类；
+        # REJECT 类规则去重时忽略 no-resolve 等尾部参数。
         if policy == "REJECT":
             options = ()
         else:
@@ -105,6 +99,7 @@ class SemanticAggregator:
                 continue
 
             self.order_counter += 1
+
             rule = parse_rule_line(
                 line=line,
                 source_name=source.name,
@@ -300,22 +295,21 @@ class SemanticAggregator:
         return sum(s.replaced_by_priority for s in self.source_stats)
 
     def render(self, plugin_cfg: dict) -> str:
+        """
+        输出纯规则 list，不输出 plugin 头，也不输出 [Rule]。
+
+        适用于：
+        - Loon filter_remote
+        - Surge RULE-SET
+        - 普通 .list 规则订阅
+        """
         rules = self.all_rules()
         kind_counter = self.merged_kind_counter(rules)
 
         out: List[str] = []
-        out.append(f"#!name={plugin_cfg.get('name', 'Merged Loon AdBlock')}")
-        out.append(f"#!desc={plugin_cfg.get('desc', 'Merged Loon adblock rules')}")
-        out.append(f"#!author={plugin_cfg.get('author', 'unknown')}")
 
-        if plugin_cfg.get("homepage"):
-            out.append(f"#!homepage={plugin_cfg['homepage']}")
-
-        if plugin_cfg.get("icon"):
-            out.append(f"#!icon={plugin_cfg['icon']}")
-
-        out.append("")
         out.append("# 由 loon-rule-aggregator 自动生成")
+        out.append("# 类型：Loon / Surge 纯规则列表")
         out.append("# 模式：语义去重，保留原始规则格式")
         out.append("#")
         out.append(f"# 原始总行数：{fmt(self.total_raw_lines())}")
@@ -327,14 +321,12 @@ class SemanticAggregator:
         out.append(f"# 包含去重前：{fmt(self.total_rules())}")
         out.append(f"# 包含去重删除：{fmt(self.dropped_containment)}")
         out.append(f"# 最终规则数：{fmt(len(rules))}")
-        out.append("#")
         out.append("# 最终规则类型：")
 
         for kind, count in kind_counter.most_common():
             out.append(f"# - {kind}: {fmt(count)}")
 
         out.append("")
-        out.append("[Rule]")
 
         for r in sorted(rules, key=lambda x: x.order):
             out.append(r.origin)
@@ -471,20 +463,6 @@ def normalize_domain(domain: str) -> str:
     return d
 
 
-def suffix_depth(domain: str) -> int:
-    return len([p for p in domain.split(".") if p])
-
-
-def domain_is_under(child: str, parent: str) -> bool:
-    child = normalize_domain(child)
-    parent = normalize_domain(parent)
-
-    if not child or not parent:
-        return False
-
-    return child == parent or child.endswith("." + parent)
-
-
 def iter_parent_suffixes(domain: str):
     parts = normalize_domain(domain).split(".")
 
@@ -493,14 +471,6 @@ def iter_parent_suffixes(domain: str):
 
 
 def has_parent_suffix(domain: str, suffix_set: set) -> bool:
-    """
-    用于 DOMAIN-SUFFIX 覆盖子 DOMAIN-SUFFIX。
-
-    example:
-    suffix_set 有 example.com
-    当前是 ads.example.com
-    则 ads.example.com 被 example.com 覆盖。
-    """
     domain = normalize_domain(domain)
 
     for parent in iter_parent_suffixes(domain):
@@ -511,13 +481,6 @@ def has_parent_suffix(domain: str, suffix_set: set) -> bool:
 
 
 def has_covering_suffix(domain: str, suffix_set: set) -> bool:
-    """
-    用于 DOMAIN-SUFFIX 覆盖 DOMAIN。
-
-    DOMAIN,ads.example.com
-    如果 suffix_set 中有 ads.example.com 或 example.com
-    都可以覆盖它。
-    """
     domain = normalize_domain(domain)
 
     if domain in suffix_set:
@@ -648,7 +611,7 @@ def main():
         except Exception as e:
             print(f"[警告] {source.name} 拉取或解析失败：{e}", file=sys.stderr)
 
-    output_rel = plugin_cfg.get("output", "dist/merged-adblock.plugin")
+    output_rel = plugin_cfg.get("output", "dist/merged-adblock.list")
     output_path = ROOT / output_rel
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

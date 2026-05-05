@@ -29,13 +29,13 @@
     {
       "name": "AWAvenue-Ads-Rule",
       "enabled": true,
-      "priority": 5,
+      "priority": 4,
       "url": "https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list"
     },
     {
       "name": "Aethersailor-adblockloonlite",
       "enabled": true,
-      "priority": 4,
+      "priority": 1,
       "url": "https://raw.githubusercontent.com/Aethersailor/adblockfilters-modified/main/rules/adblockloonlite.list"
     },
     {

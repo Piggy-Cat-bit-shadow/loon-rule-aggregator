@@ -22,6 +22,19 @@ REJECT_POLICIES = {
 }
 
 
+DEFAULT_PROTECTED_SUFFIXES = {
+    "com",
+    "net",
+    "org",
+    "cn",
+    "com.cn",
+    "net.cn",
+    "org.cn",
+    "edu.cn",
+    "gov.cn",
+}
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
@@ -46,8 +59,6 @@ class Rule:
         policy = normalize_policy(self.policy)
         target = normalize_target_by_kind(kind, self.target)
 
-        # 广告拦截规则里，REJECT / REJECT-DROP / REJECT-NO-DROP 视为同一类；
-        # REJECT 类规则去重时忽略 no-resolve 等尾部参数。
         if policy == "REJECT":
             options = ()
         else:
@@ -73,6 +84,7 @@ class SourceStats:
 @dataclass
 class ChinaSplitStats:
     china_set_size: int = 0
+    reverse_index_size: int = 0
     total_rules: int = 0
     checked_rules: int = 0
     unsupported_rules: int = 0
@@ -80,6 +92,7 @@ class ChinaSplitStats:
     global_rules: int = 0
     exact_matches: int = 0
     suffix_matches: int = 0
+    reverse_matches: int = 0
     kind_counter_cn: Counter = field(default_factory=Counter)
     kind_counter_global: Counter = field(default_factory=Counter)
     kind_counter_unsupported: Counter = field(default_factory=Counter)
@@ -220,21 +233,18 @@ class SemanticAggregator:
 
         suffix_set = {host for host, _ in suffix_rules}
 
-        # DOMAIN-SUFFIX 覆盖 DOMAIN
         if cfg.get("domain_suffix_contains_domain", True):
             for host, r in domain_rules:
                 if has_covering_suffix(host, suffix_set):
                     remove_ids.add(id(r))
                     self.dropped_domain_by_suffix += 1
 
-        # DOMAIN-SUFFIX 覆盖更深的 DOMAIN-SUFFIX
         if cfg.get("domain_suffix_contains_sub_suffix", True):
             for host, r in suffix_rules:
                 if has_parent_suffix(host, suffix_set):
                     remove_ids.add(id(r))
                     self.dropped_suffix_by_suffix += 1
 
-        # IP-CIDR 大网段覆盖小网段
         if cfg.get("ip_cidr_contains", True):
             cidr_rules = [
                 r for r in rules
@@ -310,14 +320,6 @@ class SemanticAggregator:
         return sum(s.replaced_by_priority for s in self.source_stats)
 
     def render(self, plugin_cfg: dict) -> str:
-        """
-        输出纯规则 list，不输出 plugin 头，也不输出 [Rule]。
-
-        适用于：
-        - Loon filter_remote
-        - Surge RULE-SET
-        - 普通 .list 规则订阅
-        """
         rules = self.all_rules()
         kind_counter = self.merged_kind_counter(rules)
 
@@ -361,13 +363,10 @@ def clean_line(raw: str) -> str:
 def should_skip_line(line: str) -> bool:
     if not line:
         return True
-
     if line.startswith("#") or line.startswith("//") or line.startswith(";") or line.startswith("#!"):
         return True
-
     if line.startswith("[") and line.endswith("]"):
         return True
-
     return False
 
 
@@ -425,10 +424,8 @@ def parse_rule_line(line: str, source_name: str, priority: int, order: int) -> O
 
 def normalize_policy(policy: str) -> str:
     p = policy.strip().upper()
-
     if p in REJECT_POLICIES:
         return "REJECT"
-
     return p
 
 
@@ -456,10 +453,8 @@ def text_key(line: str) -> str:
 
 def normalize_target(target: str) -> str:
     target = target.strip()
-
     if "://" in target:
         return target
-
     return target.lower().rstrip(".")
 
 
@@ -478,18 +473,15 @@ def normalize_domain(domain: str) -> str:
 
 def iter_parent_suffixes(domain: str):
     parts = normalize_domain(domain).split(".")
-
     for i in range(1, len(parts)):
         yield ".".join(parts[i:])
 
 
 def has_parent_suffix(domain: str, suffix_set: set) -> bool:
     domain = normalize_domain(domain)
-
     for parent in iter_parent_suffixes(domain):
         if parent in suffix_set:
             return True
-
     return False
 
 
@@ -529,11 +521,9 @@ def parse_china_domain_line(line: str) -> str:
 
     parts = [p.strip() for p in line.split(",")]
 
-    # 支持 DOMAIN,xxx / DOMAIN-SUFFIX,xxx
     if len(parts) >= 2 and parts[0].upper() in {"DOMAIN", "DOMAIN-SUFFIX"}:
         return normalize_domain(parts[1])
 
-    # 支持纯域名
     if "," not in line:
         return normalize_domain(line)
 
@@ -576,28 +566,100 @@ def load_china_domain_set(china_cfg: dict) -> set:
     return china_set
 
 
-def domain_match_china_set_with_reason(domain: str, china_set: set) -> Tuple[bool, str]:
+def build_china_reverse_index(china_set: set, matching_cfg: dict) -> set:
+    reverse_index = set()
+
+    protected_suffixes = get_protected_suffixes(matching_cfg)
+    min_parts = int(matching_cfg.get("min_reverse_domain_parts", 2))
+
+    for domain in china_set:
+        domain = normalize_domain(domain)
+        if not domain:
+            continue
+
+        parts = domain.split(".")
+
+        for i in range(1, len(parts)):
+            parent = ".".join(parts[i:])
+            if len(parent.split(".")) < min_parts:
+                continue
+            if parent in protected_suffixes:
+                continue
+            reverse_index.add(parent)
+
+    return reverse_index
+
+
+def get_protected_suffixes(matching_cfg: dict) -> set:
+    custom = matching_cfg.get("protected_suffixes", [])
+    result = {normalize_domain(x) for x in custom if normalize_domain(x)}
+
+    if not result:
+        result = set(DEFAULT_PROTECTED_SUFFIXES)
+
+    return result
+
+
+def is_protected_reverse_domain(domain: str, matching_cfg: dict) -> bool:
+    domain = normalize_domain(domain)
+    if not domain:
+        return True
+
+    min_parts = int(matching_cfg.get("min_reverse_domain_parts", 2))
+    if len(domain.split(".")) < min_parts:
+        return True
+
+    protected_suffixes = get_protected_suffixes(matching_cfg)
+
+    if domain in protected_suffixes:
+        return True
+
+    return False
+
+
+def domain_match_china_set_with_reason(
+    domain: str,
+    china_set: set,
+    reverse_index: set,
+    matching_cfg: dict,
+) -> Tuple[bool, str]:
     domain = normalize_domain(domain)
 
     if not domain:
         return False, ""
 
+    # 1. 精确命中
     if domain in china_set:
         return True, "exact"
 
-    for parent in iter_parent_suffixes(domain):
-        if parent in china_set:
-            return True, "suffix"
+    # 2. 父域/后缀命中：ads.qq.com 命中 qq.com
+    if matching_cfg.get("suffix_match", True):
+        for parent in iter_parent_suffixes(domain):
+            if parent in china_set:
+                return True, "suffix"
+
+    # 3. 反向子域命中：qq.com 命中 ads.qq.com 的父域索引
+    if matching_cfg.get("reverse_subdomain_match", False):
+        if not is_protected_reverse_domain(domain, matching_cfg):
+            if domain in reverse_index:
+                return True, "reverse"
 
     return False, ""
 
 
-def split_cn_global_rules(rules: List[Rule], china_set: set) -> Tuple[List[Rule], List[Rule], ChinaSplitStats]:
+def split_cn_global_rules(
+    rules: List[Rule],
+    china_set: set,
+    matching_cfg: dict,
+) -> Tuple[List[Rule], List[Rule], ChinaSplitStats]:
     cn_rules: List[Rule] = []
     global_rules: List[Rule] = []
 
+    reverse_index = build_china_reverse_index(china_set, matching_cfg)
+
     stats = ChinaSplitStats(
         china_set_size=len(china_set),
+        reverse_index_size=len(reverse_index),
         total_rules=len(rules),
     )
 
@@ -605,7 +667,6 @@ def split_cn_global_rules(rules: List[Rule], china_set: set) -> Tuple[List[Rule]
         kind = r.kind.upper()
         domain = parse_domain_from_rule(r)
 
-        # 只有 DOMAIN / DOMAIN-SUFFIX 能比较准确判断国内归属
         if not domain:
             global_rules.append(r)
             stats.unsupported_rules += 1
@@ -615,7 +676,12 @@ def split_cn_global_rules(rules: List[Rule], china_set: set) -> Tuple[List[Rule]
 
         stats.checked_rules += 1
 
-        matched, reason = domain_match_china_set_with_reason(domain, china_set)
+        matched, reason = domain_match_china_set_with_reason(
+            domain=domain,
+            china_set=china_set,
+            reverse_index=reverse_index,
+            matching_cfg=matching_cfg,
+        )
 
         if matched:
             cn_rules.append(r)
@@ -626,12 +692,13 @@ def split_cn_global_rules(rules: List[Rule], china_set: set) -> Tuple[List[Rule]
                 stats.exact_matches += 1
             elif reason == "suffix":
                 stats.suffix_matches += 1
+            elif reason == "reverse":
+                stats.reverse_matches += 1
         else:
             global_rules.append(r)
             stats.global_rules += 1
             stats.kind_counter_global[kind] += 1
 
-    # global_rules 实际包含：未命中国内 + 不可判断规则
     stats.global_rules = len(global_rules)
 
     return cn_rules, global_rules, stats
@@ -729,12 +796,14 @@ def print_china_split_summary(stats: ChinaSplitStats, output_cn_path: Path, outp
     print("国内 / 非国内规则拆分完成")
     print_line("-")
     print(f"国内域名库数量：        {fmt(stats.china_set_size)}")
+    print(f"反向父域索引数量：      {fmt(stats.reverse_index_size)}")
     print(f"全量规则数：            {fmt(stats.total_rules)}")
     print(f"参与国内判断规则数：    {fmt(stats.checked_rules)}")
     print(f"不可判断规则数：        {fmt(stats.unsupported_rules)}")
     print(f"匹配国内规则数：        {fmt(stats.cn_rules)}")
     print(f"  - 精确命中：          {fmt(stats.exact_matches)}")
     print(f"  - 父域/后缀命中：     {fmt(stats.suffix_matches)}")
+    print(f"  - 反向子域命中：      {fmt(stats.reverse_matches)}")
     print(f"非国内规则数：          {fmt(stats.global_rules)}")
 
     if stats.kind_counter_cn:
@@ -820,12 +889,17 @@ def main():
 
     print_summary(aggregator, final_rules)
 
-    # 国内 / 非国内拆分
     china_cfg = cfg.get("china_domain", {})
     china_set = load_china_domain_set(china_cfg)
 
     if china_set:
-        cn_rules, global_rules, china_stats = split_cn_global_rules(final_rules, china_set)
+        matching_cfg = china_cfg.get("matching", {})
+
+        cn_rules, global_rules, china_stats = split_cn_global_rules(
+            final_rules,
+            china_set,
+            matching_cfg,
+        )
 
         output_cn_rel = plugin_cfg.get("output_cn", "dist/merged-adblock-cn.list")
         output_global_rel = plugin_cfg.get("output_global", "dist/merged-adblock-global.list")
@@ -841,11 +915,13 @@ def main():
             "# 类型：Loon / Surge 纯规则列表",
             "# 模式：国内域名库匹配拆分",
             f"# 国内域名库数量：{fmt(len(china_set))}",
+            f"# 反向父域索引数量：{fmt(china_stats.reverse_index_size)}",
             f"# 全量规则数：{fmt(len(final_rules))}",
             f"# 国内规则数：{fmt(len(cn_rules))}",
             f"# 非国内规则数：{fmt(len(global_rules))}",
             f"# 国内精确命中：{fmt(china_stats.exact_matches)}",
             f"# 国内父域/后缀命中：{fmt(china_stats.suffix_matches)}",
+            f"# 国内反向子域命中：{fmt(china_stats.reverse_matches)}",
             f"# 不可判断规则数：{fmt(china_stats.unsupported_rules)}",
         ]
 

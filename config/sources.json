@@ -1,16 +1,15 @@
 {
   "plugin": {
-    "name": "Merged Loon AdBlock",
-    "desc": "聚合多个已符合 Loon/Surge 规则格式的广告规则源，保留原格式，支持结构去重和可选包含去重",
+    "name": "Merged Loon AdBlock List",
+    "desc": "聚合多个已符合 Loon/Surge 格式的广告规则列表，保留原格式，支持结构去重和可选包含去重",
     "author": "Piggy-Cat-bit-shadow",
     "homepage": "https://github.com/Piggy-Cat-bit-shadow/loon-rule-aggregator",
-    "icon": "https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Advertising.png",
     "output": "dist/merged-adblock.list"
   },
   "dedupe": {
     "mode": "semantic",
     "description": "semantic = 内部解析成规则对象去重，但输出仍保留原始 Loon/Surge 规则格式。",
-    "priority_note": "priority 数字越大，重复规则冲突时越优先保留。默认使用 5/4/3/2。",
+    "priority_note": "priority 数字越大，重复规则冲突时越优先保留。",
     "structural": {
       "enabled": true,
       "description": "同类型、同目标、同策略、同参数的规则视为重复；保留 priority 更高的原始写法。"

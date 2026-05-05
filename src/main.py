@@ -484,8 +484,12 @@ def has_covering_suffix(domain: str, suffix_set: set) -> bool:
 
 
 def fetch_url(url: str, user_agent: str = "") -> str:
+    ua = user_agent or DEFAULT_USER_AGENT
+
+    print(f"使用 UA：{ua}")
+
     headers = {
-        "User-Agent": user_agent or DEFAULT_USER_AGENT,
+        "User-Agent": ua,
         "Accept": "*/*",
         "Connection": "keep-alive",
     }
@@ -605,7 +609,11 @@ def main():
             text = fetch_url(source.url, source.user_agent)
             aggregator.parse_text(text, source)
         except Exception as e:
-            print(f"[警告] {source.name} 拉取或解析失败：{e}", file=sys.stderr)
+            print_line("!")
+            print(f"拉取失败：{source.name}")
+            print(f"地址：{source.url}")
+            print(f"错误：{repr(e)}")
+            print_line("!")
 
     output_rel = plugin_cfg.get("output", "dist/merged-adblock.list")
     output_path = ROOT / output_rel

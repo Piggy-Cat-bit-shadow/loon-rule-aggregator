@@ -5,7 +5,7 @@
     "author": "Piggy-Cat-bit-shadow",
     "homepage": "https://github.com/Piggy-Cat-bit-shadow/loon-rule-aggregator",
     "icon": "https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Advertising.png",
-    "output": "dist/merged-adblock.plugin"
+    "output": "dist/merged-adblock.list"
   },
   "dedupe": {
     "mode": "semantic",

@@ -2,7 +2,8 @@ import ipaddress
 import json
 import re
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -42,6 +43,31 @@ class Rule:
         )
 
 
+@dataclass
+class SourceStats:
+    name: str
+    url: str
+    raw_lines: int = 0
+    empty_lines: int = 0
+    comment_lines: int = 0
+    section_lines: int = 0
+    recognized_rules: int = 0
+    unknown_kept: int = 0
+    structural_duplicates: int = 0
+    unknown_duplicates: int = 0
+    added_unique: int = 0
+    replaced_by_priority: int = 0
+    kind_counter: Counter = field(default_factory=Counter)
+
+    @property
+    def skipped_total(self) -> int:
+        return self.empty_lines + self.comment_lines + self.section_lines
+
+    @property
+    def duplicate_total(self) -> int:
+        return self.structural_duplicates + self.unknown_duplicates
+
+
 class SemanticAggregator:
     """
     工作方式：
@@ -57,16 +83,33 @@ class SemanticAggregator:
         self.dedupe_cfg = dedupe_cfg or {}
         self.rules_by_key: Dict[Tuple[str, str, str, Tuple[str, ...]], Rule] = {}
         self.unknown_by_key: Dict[str, Rule] = {}
-        self.stats: List[str] = []
+
+        self.source_stats: List[SourceStats] = []
         self.order_counter = 0
         self.dropped_containment = 0
 
+        self.dropped_domain_by_suffix = 0
+        self.dropped_suffix_by_suffix = 0
+        self.dropped_cidr_by_cidr = 0
+
     def parse_text(self, text: str, source: Source):
+        stats = SourceStats(name=source.name, url=source.url)
         before = self.total_rules()
 
         for raw in text.splitlines():
+            stats.raw_lines += 1
             line = clean_line(raw)
-            if not line or should_skip_line(line):
+
+            if not line:
+                stats.empty_lines += 1
+                continue
+
+            skip_reason = skip_reason_of_line(line)
+            if skip_reason == "comment":
+                stats.comment_lines += 1
+                continue
+            if skip_reason == "section":
+                stats.section_lines += 1
                 continue
 
             self.order_counter += 1
@@ -78,11 +121,10 @@ class SemanticAggregator:
             )
 
             if rule is None:
-                # 不认识的行也保留，但只做文本级去重
                 key = text_key(line)
                 old = self.unknown_by_key.get(key)
-                if old is None or better(rule_candidate_priority=source.priority, rule_candidate_order=self.order_counter,
-                                         old_priority=old.priority, old_order=old.order):
+
+                if old is None:
                     self.unknown_by_key[key] = Rule(
                         kind="UNKNOWN",
                         target=key,
@@ -93,15 +135,46 @@ class SemanticAggregator:
                         priority=source.priority,
                         order=self.order_counter,
                     )
+                    stats.unknown_kept += 1
+                else:
+                    stats.unknown_duplicates += 1
+                    if better(
+                        rule_candidate_priority=source.priority,
+                        rule_candidate_order=self.order_counter,
+                        old_priority=old.priority,
+                        old_order=old.order,
+                    ):
+                        self.unknown_by_key[key] = Rule(
+                            kind="UNKNOWN",
+                            target=key,
+                            policy="",
+                            options=(),
+                            origin=line,
+                            source=source.name,
+                            priority=source.priority,
+                            order=self.order_counter,
+                        )
+                        stats.replaced_by_priority += 1
                 continue
+
+            stats.recognized_rules += 1
+            stats.kind_counter[rule.kind.upper()] += 1
 
             key = rule.structural_key
             old = self.rules_by_key.get(key)
-            if old is None or better(rule.priority, rule.order, old.priority, old.order):
+
+            if old is None:
                 self.rules_by_key[key] = rule
+            else:
+                stats.structural_duplicates += 1
+                if better(rule.priority, rule.order, old.priority, old.order):
+                    self.rules_by_key[key] = rule
+                    stats.replaced_by_priority += 1
 
         after = self.total_rules()
-        self.stats.append(f"{source.name}: +{after - before}")
+        stats.added_unique = after - before
+        self.source_stats.append(stats)
+        print_source_stats(stats)
 
     def total_rules(self) -> int:
         return len(self.rules_by_key) + len(self.unknown_by_key)
@@ -131,7 +204,6 @@ class SemanticAggregator:
             if host:
                 suffixes.append((host, r))
 
-        # DOMAIN-SUFFIX 覆盖 DOMAIN
         if cfg.get("domain_suffix_contains_domain", True):
             for r in domain_rules:
                 host = normalize_domain(r.target)
@@ -139,9 +211,10 @@ class SemanticAggregator:
                     continue
                 covering = find_covering_suffix(host, suffixes)
                 if covering is not None:
+                    if id(r) not in remove_ids:
+                        self.dropped_domain_by_suffix += 1
                     remove_ids.add(id(r))
 
-        # DOMAIN-SUFFIX 覆盖更深的 DOMAIN-SUFFIX
         if cfg.get("domain_suffix_contains_sub_suffix", True):
             sorted_suffixes = sorted(suffixes, key=lambda x: suffix_depth(x[0]))
             for host, r in sorted_suffixes:
@@ -151,15 +224,17 @@ class SemanticAggregator:
                     if suffix_depth(parent) >= suffix_depth(host):
                         continue
                     if domain_is_under(host, parent):
+                        if id(r) not in remove_ids:
+                            self.dropped_suffix_by_suffix += 1
                         remove_ids.add(id(r))
                         break
 
-        # IP-CIDR 大网段覆盖小网段
         if cfg.get("ip_cidr_contains", True):
             cidr_rules = [
                 r for r in rules
                 if r.kind.upper() in {"IP-CIDR", "IP-CIDR6"} and r.policy.upper().startswith("REJECT")
             ]
+
             networks: List[Tuple[ipaddress._BaseNetwork, Rule]] = []
             for r in cidr_rules:
                 try:
@@ -168,6 +243,7 @@ class SemanticAggregator:
                     pass
 
             networks.sort(key=lambda x: (x[0].version, x[0].prefixlen))
+
             for net, r in networks:
                 for parent_net, parent_rule in networks:
                     if id(parent_rule) == id(r):
@@ -177,14 +253,50 @@ class SemanticAggregator:
                     if parent_net.prefixlen >= net.prefixlen:
                         continue
                     if net.subnet_of(parent_net):
+                        if id(r) not in remove_ids:
+                            self.dropped_cidr_by_cidr += 1
                         remove_ids.add(id(r))
                         break
 
         self.dropped_containment = len(remove_ids)
         return [r for r in rules if id(r) not in remove_ids]
 
+    def merged_kind_counter(self, rules: List[Rule]) -> Counter:
+        counter = Counter()
+        for r in rules:
+            counter[r.kind.upper()] += 1
+        return counter
+
+    def total_raw_lines(self) -> int:
+        return sum(s.raw_lines for s in self.source_stats)
+
+    def total_empty_lines(self) -> int:
+        return sum(s.empty_lines for s in self.source_stats)
+
+    def total_comment_lines(self) -> int:
+        return sum(s.comment_lines for s in self.source_stats)
+
+    def total_section_lines(self) -> int:
+        return sum(s.section_lines for s in self.source_stats)
+
+    def total_recognized_rules(self) -> int:
+        return sum(s.recognized_rules for s in self.source_stats)
+
+    def total_unknown_kept(self) -> int:
+        return sum(s.unknown_kept for s in self.source_stats)
+
+    def total_structural_duplicates(self) -> int:
+        return sum(s.structural_duplicates for s in self.source_stats)
+
+    def total_unknown_duplicates(self) -> int:
+        return sum(s.unknown_duplicates for s in self.source_stats)
+
+    def total_replaced_by_priority(self) -> int:
+        return sum(s.replaced_by_priority for s in self.source_stats)
+
     def render(self, plugin_cfg: dict) -> str:
         rules = self.all_rules()
+        kind_counter = self.merged_kind_counter(rules)
 
         out: List[str] = []
         out.append(f"#!name={plugin_cfg.get('name', 'Merged Loon AdBlock')}")
@@ -197,16 +309,30 @@ class SemanticAggregator:
         out.append("")
         out.append("# Generated by loon-rule-aggregator")
         out.append("# Mode: semantic dedupe, preserve original rule format")
-        out.append("# Source stats:")
-        for stat in self.stats:
-            out.append(f"# - {stat}")
-        out.append(f"# Structural unique rules before containment: {self.total_rules()}")
-        out.append(f"# Dropped by containment dedupe: {self.dropped_containment}")
-        out.append(f"# Final rules: {len(rules)}")
+        out.append("#")
+        out.append("# Merge Summary:")
+        out.append(f"# Raw lines total: {fmt(self.total_raw_lines())}")
+        out.append(f"# Empty lines skipped: {fmt(self.total_empty_lines())}")
+        out.append(f"# Comment lines skipped: {fmt(self.total_comment_lines())}")
+        out.append(f"# Section lines skipped: {fmt(self.total_section_lines())}")
+        out.append(f"# Recognized rules total: {fmt(self.total_recognized_rules())}")
+        out.append(f"# Unknown kept total: {fmt(self.total_unknown_kept())}")
+        out.append(f"# Structural duplicates: {fmt(self.total_structural_duplicates())}")
+        out.append(f"# Unknown duplicates: {fmt(self.total_unknown_duplicates())}")
+        out.append(f"# Replaced by priority: {fmt(self.total_replaced_by_priority())}")
+        out.append(f"# Unique before containment: {fmt(self.total_rules())}")
+        out.append(f"# Dropped by containment: {fmt(self.dropped_containment)}")
+        out.append(f"#   - DOMAIN covered by DOMAIN-SUFFIX: {fmt(self.dropped_domain_by_suffix)}")
+        out.append(f"#   - sub DOMAIN-SUFFIX covered by broader DOMAIN-SUFFIX: {fmt(self.dropped_suffix_by_suffix)}")
+        out.append(f"#   - IP-CIDR covered by broader IP-CIDR: {fmt(self.dropped_cidr_by_cidr)}")
+        out.append(f"# Final rules: {fmt(len(rules))}")
+        out.append("#")
+        out.append("# Final rule kinds:")
+        for kind, count in kind_counter.most_common():
+            out.append(f"#   - {kind}: {fmt(count)}")
         out.append("")
 
         out.append("[Rule]")
-        # 按原始出现顺序输出，更接近源规则顺序；如果你想字母排序，可改成 key=lambda r: r.origin.lower()
         for r in sorted(rules, key=lambda x: x.order):
             out.append(r.origin)
         out.append("")
@@ -215,7 +341,6 @@ class SemanticAggregator:
 
 
 def better(rule_candidate_priority: int, rule_candidate_order: int, old_priority: int, old_order: int) -> bool:
-    # priority 更高者优先；priority 相同则先出现者优先
     if rule_candidate_priority != old_priority:
         return rule_candidate_priority > old_priority
     return rule_candidate_order < old_order
@@ -225,20 +350,21 @@ def clean_line(raw: str) -> str:
     return raw.strip()
 
 
-def should_skip_line(line: str) -> bool:
+def skip_reason_of_line(line: str) -> Optional[str]:
     if not line:
-        return True
-    if line.startswith("#") or line.startswith("//") or line.startswith(";"):
-        return True
-    if line.startswith("#!"):
-        return True
+        return "empty"
+    if line.startswith("#") or line.startswith("//") or line.startswith(";") or line.startswith("#!"):
+        return "comment"
     if line.startswith("[") and line.endswith("]"):
-        return True
-    return False
+        return "section"
+    return None
+
+
+def should_skip_line(line: str) -> bool:
+    return skip_reason_of_line(line) is not None
 
 
 def split_rule(line: str) -> List[str]:
-    # Loon/Surge/Clash 规则核心都是逗号分隔；这里不处理 URL-REGEX 内部逗号的极端情况
     return [p.strip() for p in line.split(",")]
 
 
@@ -267,7 +393,6 @@ def parse_rule_line(line: str, source_name: str, priority: int, order: int) -> O
     if kind not in supported:
         return None
 
-    # FINAL 这种可能只有 FINAL,PROXY；本项目广告过滤源通常不会有
     if kind == "FINAL":
         target = "FINAL"
         policy = parts[1] if len(parts) >= 2 else ""
@@ -345,6 +470,69 @@ def load_config() -> dict:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def fmt(num: int) -> str:
+    return f"{num:,}"
+
+
+def print_line(char: str = "=", width: int = 72):
+    print(char * width)
+
+
+def print_source_stats(stats: SourceStats):
+    print_line("=")
+    print(f"📥 Source: {stats.name}")
+    print(f"URL: {stats.url}")
+    print_line("-")
+    print(f"Raw lines:                {fmt(stats.raw_lines)}")
+    print(f"Skipped empty lines:      {fmt(stats.empty_lines)}")
+    print(f"Skipped comments:         {fmt(stats.comment_lines)}")
+    print(f"Skipped sections:         {fmt(stats.section_lines)}")
+    print(f"Recognized rules:         {fmt(stats.recognized_rules)}")
+    print(f"Unknown kept:             {fmt(stats.unknown_kept)}")
+    print(f"Structural duplicates:    {fmt(stats.structural_duplicates)}")
+    print(f"Unknown duplicates:       {fmt(stats.unknown_duplicates)}")
+    print(f"Replaced by priority:     {fmt(stats.replaced_by_priority)}")
+    print(f"Added unique rules:       {fmt(stats.added_unique)}")
+
+    if stats.kind_counter:
+        print("Rule kinds:")
+        for kind, count in stats.kind_counter.most_common():
+            print(f"  - {kind:<16} {fmt(count)}")
+
+    print_line("=")
+    print()
+
+
+def print_summary(aggregator: SemanticAggregator, final_rules: List[Rule]):
+    kind_counter = aggregator.merged_kind_counter(final_rules)
+
+    print_line("=")
+    print("📊 Merge Summary")
+    print_line("-")
+    print(f"Raw lines total:          {fmt(aggregator.total_raw_lines())}")
+    print(f"Empty lines skipped:      {fmt(aggregator.total_empty_lines())}")
+    print(f"Comment lines skipped:    {fmt(aggregator.total_comment_lines())}")
+    print(f"Section lines skipped:    {fmt(aggregator.total_section_lines())}")
+    print(f"Recognized rules total:   {fmt(aggregator.total_recognized_rules())}")
+    print(f"Unknown kept total:       {fmt(aggregator.total_unknown_kept())}")
+    print(f"Structural duplicates:    {fmt(aggregator.total_structural_duplicates())}")
+    print(f"Unknown duplicates:       {fmt(aggregator.total_unknown_duplicates())}")
+    print(f"Replaced by priority:     {fmt(aggregator.total_replaced_by_priority())}")
+    print(f"Unique before contain:    {fmt(aggregator.total_rules())}")
+    print(f"Containment removed:      {fmt(aggregator.dropped_containment)}")
+    print(f"  - DOMAIN by suffix:     {fmt(aggregator.dropped_domain_by_suffix)}")
+    print(f"  - sub suffix by suffix: {fmt(aggregator.dropped_suffix_by_suffix)}")
+    print(f"  - CIDR by CIDR:         {fmt(aggregator.dropped_cidr_by_cidr)}")
+    print(f"Final rules:              {fmt(len(final_rules))}")
+
+    if kind_counter:
+        print("Final rule kinds:")
+        for kind, count in kind_counter.most_common():
+            print(f"  - {kind:<16} {fmt(count)}")
+
+    print_line("=")
+
+
 def main():
     cfg = load_config()
     plugin_cfg = cfg.get("plugin", {})
@@ -369,9 +557,18 @@ def main():
         print("No enabled sources. Please edit config/sources.json")
         return 1
 
+    print_line("=")
+    print("🚀 Loon Rule Aggregator")
+    print_line("-")
+    print(f"Enabled sources:          {len(enabled_sources)}")
+    print(f"Dedupe mode:              {dedupe_cfg.get('mode', 'semantic')}")
+    print(f"Containment dedupe:       {dedupe_cfg.get('containment', {}).get('enabled', False)}")
+    print_line("=")
+    print()
+
     for source in enabled_sources:
         try:
-            print(f"Fetching {source.name}: {source.url}")
+            print(f"Fetching {source.name} ...")
             text = fetch_url(source.url)
             aggregator.parse_text(text, source)
         except Exception as e:
@@ -380,13 +577,15 @@ def main():
     output_rel = plugin_cfg.get("output", "dist/merged-adblock.plugin")
     output_path = ROOT / output_rel
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(aggregator.render(plugin_cfg), encoding="utf-8")
 
-    final_rules = len(aggregator.all_rules())
-    print(f"Done: {output_path}")
-    print(f"Structural unique rules before containment: {aggregator.total_rules()}")
-    print(f"Dropped by containment dedupe: {aggregator.dropped_containment}")
-    print(f"Final rules: {final_rules}")
+    rendered = aggregator.render(plugin_cfg)
+    output_path.write_text(rendered, encoding="utf-8")
+
+    final_rules = aggregator.all_rules()
+    print_summary(aggregator, final_rules)
+
+    print()
+    print(f"✅ Done: {output_path}")
     return 0
 
 

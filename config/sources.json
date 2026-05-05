@@ -1,12 +1,10 @@
 {
   "plugin": {
     "name": "Merged Loon AdBlock List",
-    "desc": "聚合多个已符合 Loon/Surge 格式的广告规则列表，保留原格式，支持结构去重、包含去重和国内域名提取",
+    "desc": "聚合多个已符合 Loon/Surge 格式的广告规则列表，保留原格式，支持结构去重和可选包含去重",
     "author": "Piggy-Cat-bit-shadow",
     "homepage": "https://github.com/Piggy-Cat-bit-shadow/loon-rule-aggregator",
-    "output": "dist/merged-adblock.list",
-    "output_cn": "dist/merged-adblock-cn.list",
-    "output_global": "dist/merged-adblock-global.list"
+    "output": "dist/merged-adblock.list"
   },
   "dedupe": {
     "mode": "semantic",
@@ -25,37 +23,6 @@
       "domain_keyword_contains": false,
       "url_regex_contains": false
     }
-  },
-  "china_domain": {
-    "enabled": true,
-    "matching": {
-      "suffix_match": true,
-      "reverse_subdomain_match": true,
-      "min_reverse_domain_parts": 2,
-      "protected_suffixes": [
-        "com",
-        "net",
-        "org",
-        "cn",
-        "com.cn",
-        "net.cn",
-        "org.cn",
-        "edu.cn",
-        "gov.cn"
-      ]
-    },
-    "sources": [
-      {
-        "name": "217heidai-china",
-        "enabled": true,
-        "url": "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/china.txt"
-      },
-      {
-        "name": "ChinaMax-Domain",
-        "enabled": true,
-        "url": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/ChinaMax/ChinaMax_Domain.list"
-      }
-    ]
   },
   "sources": [
     {

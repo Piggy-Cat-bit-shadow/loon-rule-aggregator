@@ -30,6 +30,6 @@ jobs:
       - name: Commit and push
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update merged Loon adblock list"
+          commit_message: "chore: update merged Loon adblock lists"
           file_pattern: "dist/*"
 

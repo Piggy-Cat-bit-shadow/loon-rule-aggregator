@@ -48,37 +48,16 @@ class SourceStats:
     name: str
     url: str
     raw_lines: int = 0
-    empty_lines: int = 0
-    comment_lines: int = 0
-    section_lines: int = 0
+    skipped_lines: int = 0
     recognized_rules: int = 0
     unknown_kept: int = 0
-    structural_duplicates: int = 0
-    unknown_duplicates: int = 0
+    duplicates: int = 0
     added_unique: int = 0
     replaced_by_priority: int = 0
     kind_counter: Counter = field(default_factory=Counter)
 
-    @property
-    def skipped_total(self) -> int:
-        return self.empty_lines + self.comment_lines + self.section_lines
-
-    @property
-    def duplicate_total(self) -> int:
-        return self.structural_duplicates + self.unknown_duplicates
-
 
 class SemanticAggregator:
-    """
-    工作方式：
-    1. 读取源规则；
-    2. 跳过注释、空行、metadata、section header；
-    3. 解析为 Rule 对象；
-    4. 先做结构去重：kind + target + policy + options；
-    5. 可选做包含去重：DOMAIN-SUFFIX 覆盖 DOMAIN / 子 DOMAIN-SUFFIX，IP-CIDR 大网段覆盖小网段；
-    6. 输出仍保留被保留下来的原始规则行，不转换格式。
-    """
-
     def __init__(self, dedupe_cfg: dict):
         self.dedupe_cfg = dedupe_cfg or {}
         self.rules_by_key: Dict[Tuple[str, str, str, Tuple[str, ...]], Rule] = {}
@@ -86,8 +65,8 @@ class SemanticAggregator:
 
         self.source_stats: List[SourceStats] = []
         self.order_counter = 0
-        self.dropped_containment = 0
 
+        self.dropped_containment = 0
         self.dropped_domain_by_suffix = 0
         self.dropped_suffix_by_suffix = 0
         self.dropped_cidr_by_cidr = 0
@@ -100,16 +79,8 @@ class SemanticAggregator:
             stats.raw_lines += 1
             line = clean_line(raw)
 
-            if not line:
-                stats.empty_lines += 1
-                continue
-
-            skip_reason = skip_reason_of_line(line)
-            if skip_reason == "comment":
-                stats.comment_lines += 1
-                continue
-            if skip_reason == "section":
-                stats.section_lines += 1
+            if should_skip_line(line):
+                stats.skipped_lines += 1
                 continue
 
             self.order_counter += 1
@@ -137,13 +108,8 @@ class SemanticAggregator:
                     )
                     stats.unknown_kept += 1
                 else:
-                    stats.unknown_duplicates += 1
-                    if better(
-                        rule_candidate_priority=source.priority,
-                        rule_candidate_order=self.order_counter,
-                        old_priority=old.priority,
-                        old_order=old.order,
-                    ):
+                    stats.duplicates += 1
+                    if better(source.priority, self.order_counter, old.priority, old.order):
                         self.unknown_by_key[key] = Rule(
                             kind="UNKNOWN",
                             target=key,
@@ -166,7 +132,7 @@ class SemanticAggregator:
             if old is None:
                 self.rules_by_key[key] = rule
             else:
-                stats.structural_duplicates += 1
+                stats.duplicates += 1
                 if better(rule.priority, rule.order, old.priority, old.order):
                     self.rules_by_key[key] = rule
                     stats.replaced_by_priority += 1
@@ -181,8 +147,10 @@ class SemanticAggregator:
 
     def all_rules(self) -> List[Rule]:
         rules = list(self.rules_by_key.values()) + list(self.unknown_by_key.values())
+
         if self.dedupe_cfg.get("containment", {}).get("enabled", False):
             rules = self.apply_containment_dedupe(rules)
+
         return rules
 
     def apply_containment_dedupe(self, rules: List[Rule]) -> List[Rule]:
@@ -209,14 +177,15 @@ class SemanticAggregator:
                 host = normalize_domain(r.target)
                 if not host:
                     continue
-                covering = find_covering_suffix(host, suffixes)
-                if covering is not None:
+
+                if find_covering_suffix(host, suffixes) is not None:
                     if id(r) not in remove_ids:
                         self.dropped_domain_by_suffix += 1
                     remove_ids.add(id(r))
 
         if cfg.get("domain_suffix_contains_sub_suffix", True):
             sorted_suffixes = sorted(suffixes, key=lambda x: suffix_depth(x[0]))
+
             for host, r in sorted_suffixes:
                 for parent, parent_rule in sorted_suffixes:
                     if id(parent_rule) == id(r):
@@ -232,7 +201,8 @@ class SemanticAggregator:
         if cfg.get("ip_cidr_contains", True):
             cidr_rules = [
                 r for r in rules
-                if r.kind.upper() in {"IP-CIDR", "IP-CIDR6"} and r.policy.upper().startswith("REJECT")
+                if r.kind.upper() in {"IP-CIDR", "IP-CIDR6"}
+                and r.policy.upper().startswith("REJECT")
             ]
 
             networks: List[Tuple[ipaddress._BaseNetwork, Rule]] = []
@@ -270,14 +240,8 @@ class SemanticAggregator:
     def total_raw_lines(self) -> int:
         return sum(s.raw_lines for s in self.source_stats)
 
-    def total_empty_lines(self) -> int:
-        return sum(s.empty_lines for s in self.source_stats)
-
-    def total_comment_lines(self) -> int:
-        return sum(s.comment_lines for s in self.source_stats)
-
-    def total_section_lines(self) -> int:
-        return sum(s.section_lines for s in self.source_stats)
+    def total_skipped_lines(self) -> int:
+        return sum(s.skipped_lines for s in self.source_stats)
 
     def total_recognized_rules(self) -> int:
         return sum(s.recognized_rules for s in self.source_stats)
@@ -285,11 +249,8 @@ class SemanticAggregator:
     def total_unknown_kept(self) -> int:
         return sum(s.unknown_kept for s in self.source_stats)
 
-    def total_structural_duplicates(self) -> int:
-        return sum(s.structural_duplicates for s in self.source_stats)
-
-    def total_unknown_duplicates(self) -> int:
-        return sum(s.unknown_duplicates for s in self.source_stats)
+    def total_duplicates(self) -> int:
+        return sum(s.duplicates for s in self.source_stats)
 
     def total_replaced_by_priority(self) -> int:
         return sum(s.replaced_by_priority for s in self.source_stats)
@@ -302,41 +263,39 @@ class SemanticAggregator:
         out.append(f"#!name={plugin_cfg.get('name', 'Merged Loon AdBlock')}")
         out.append(f"#!desc={plugin_cfg.get('desc', 'Merged Loon adblock rules')}")
         out.append(f"#!author={plugin_cfg.get('author', 'unknown')}")
+
         if plugin_cfg.get("homepage"):
             out.append(f"#!homepage={plugin_cfg['homepage']}")
+
         if plugin_cfg.get("icon"):
             out.append(f"#!icon={plugin_cfg['icon']}")
-        out.append("")
-        out.append("# Generated by loon-rule-aggregator")
-        out.append("# Mode: semantic dedupe, preserve original rule format")
-        out.append("#")
-        out.append("# Merge Summary:")
-        out.append(f"# Raw lines total: {fmt(self.total_raw_lines())}")
-        out.append(f"# Empty lines skipped: {fmt(self.total_empty_lines())}")
-        out.append(f"# Comment lines skipped: {fmt(self.total_comment_lines())}")
-        out.append(f"# Section lines skipped: {fmt(self.total_section_lines())}")
-        out.append(f"# Recognized rules total: {fmt(self.total_recognized_rules())}")
-        out.append(f"# Unknown kept total: {fmt(self.total_unknown_kept())}")
-        out.append(f"# Structural duplicates: {fmt(self.total_structural_duplicates())}")
-        out.append(f"# Unknown duplicates: {fmt(self.total_unknown_duplicates())}")
-        out.append(f"# Replaced by priority: {fmt(self.total_replaced_by_priority())}")
-        out.append(f"# Unique before containment: {fmt(self.total_rules())}")
-        out.append(f"# Dropped by containment: {fmt(self.dropped_containment)}")
-        out.append(f"#   - DOMAIN covered by DOMAIN-SUFFIX: {fmt(self.dropped_domain_by_suffix)}")
-        out.append(f"#   - sub DOMAIN-SUFFIX covered by broader DOMAIN-SUFFIX: {fmt(self.dropped_suffix_by_suffix)}")
-        out.append(f"#   - IP-CIDR covered by broader IP-CIDR: {fmt(self.dropped_cidr_by_cidr)}")
-        out.append(f"# Final rules: {fmt(len(rules))}")
-        out.append("#")
-        out.append("# Final rule kinds:")
-        for kind, count in kind_counter.most_common():
-            out.append(f"#   - {kind}: {fmt(count)}")
-        out.append("")
 
+        out.append("")
+        out.append("# 由 loon-rule-aggregator 自动生成")
+        out.append("# 模式：语义去重，保留原始规则格式")
+        out.append("#")
+        out.append(f"# 原始总行数：{fmt(self.total_raw_lines())}")
+        out.append(f"# 跳过行数：{fmt(self.total_skipped_lines())}")
+        out.append(f"# 有效规则数：{fmt(self.total_recognized_rules())}")
+        out.append(f"# 未识别但保留：{fmt(self.total_unknown_kept())}")
+        out.append(f"# 结构重复数：{fmt(self.total_duplicates())}")
+        out.append(f"# 优先级替换数：{fmt(self.total_replaced_by_priority())}")
+        out.append(f"# 包含去重前：{fmt(self.total_rules())}")
+        out.append(f"# 包含去重删除：{fmt(self.dropped_containment)}")
+        out.append(f"# 最终规则数：{fmt(len(rules))}")
+        out.append("#")
+        out.append("# 最终规则类型：")
+
+        for kind, count in kind_counter.most_common():
+            out.append(f"# - {kind}: {fmt(count)}")
+
+        out.append("")
         out.append("[Rule]")
+
         for r in sorted(rules, key=lambda x: x.order):
             out.append(r.origin)
-        out.append("")
 
+        out.append("")
         return "\n".join(out).rstrip() + "\n"
 
 
@@ -350,18 +309,17 @@ def clean_line(raw: str) -> str:
     return raw.strip()
 
 
-def skip_reason_of_line(line: str) -> Optional[str]:
-    if not line:
-        return "empty"
-    if line.startswith("#") or line.startswith("//") or line.startswith(";") or line.startswith("#!"):
-        return "comment"
-    if line.startswith("[") and line.endswith("]"):
-        return "section"
-    return None
-
-
 def should_skip_line(line: str) -> bool:
-    return skip_reason_of_line(line) is not None
+    if not line:
+        return True
+
+    if line.startswith("#") or line.startswith("//") or line.startswith(";") or line.startswith("#!"):
+        return True
+
+    if line.startswith("[") and line.endswith("]"):
+        return True
+
+    return False
 
 
 def split_rule(line: str) -> List[str]:
@@ -370,10 +328,12 @@ def split_rule(line: str) -> List[str]:
 
 def parse_rule_line(line: str, source_name: str, priority: int, order: int) -> Optional[Rule]:
     parts = split_rule(line)
+
     if len(parts) < 2:
         return None
 
     kind = parts[0].upper()
+
     supported = {
         "DOMAIN",
         "DOMAIN-SUFFIX",
@@ -423,16 +383,20 @@ def text_key(line: str) -> str:
 
 def normalize_target(target: str) -> str:
     target = target.strip()
+
     if "://" in target:
         return target
+
     return target.lower().rstrip(".")
 
 
 def normalize_domain(domain: str) -> str:
     d = domain.strip().lower().rstrip(".")
     d = d.lstrip("*.").lstrip(".")
+
     if not d or "/" in d or ":" in d:
         return ""
+
     return d
 
 
@@ -443,18 +407,23 @@ def suffix_depth(domain: str) -> int:
 def domain_is_under(child: str, parent: str) -> bool:
     child = normalize_domain(child)
     parent = normalize_domain(parent)
+
     if not child or not parent:
         return False
+
     return child == parent or child.endswith("." + parent)
 
 
 def find_covering_suffix(host: str, suffixes: List[Tuple[str, Rule]]) -> Optional[Rule]:
     host = normalize_domain(host)
+
     if not host:
         return None
+
     for suffix, rule in suffixes:
         if domain_is_under(host, suffix):
             return rule
+
     return None
 
 
@@ -474,63 +443,59 @@ def fmt(num: int) -> str:
     return f"{num:,}"
 
 
-def print_line(char: str = "=", width: int = 72):
+def print_line(char: str = "=", width: int = 64):
     print(char * width)
 
 
 def print_source_stats(stats: SourceStats):
-    print_line("=")
-    print(f"📥 Source: {stats.name}")
-    print(f"URL: {stats.url}")
+    print_line()
+    print(f"规则源：{stats.name}")
     print_line("-")
-    print(f"Raw lines:                {fmt(stats.raw_lines)}")
-    print(f"Skipped empty lines:      {fmt(stats.empty_lines)}")
-    print(f"Skipped comments:         {fmt(stats.comment_lines)}")
-    print(f"Skipped sections:         {fmt(stats.section_lines)}")
-    print(f"Recognized rules:         {fmt(stats.recognized_rules)}")
-    print(f"Unknown kept:             {fmt(stats.unknown_kept)}")
-    print(f"Structural duplicates:    {fmt(stats.structural_duplicates)}")
-    print(f"Unknown duplicates:       {fmt(stats.unknown_duplicates)}")
-    print(f"Replaced by priority:     {fmt(stats.replaced_by_priority)}")
-    print(f"Added unique rules:       {fmt(stats.added_unique)}")
+    print(f"原始行数：{fmt(stats.raw_lines)}")
+    print(f"跳过行数：{fmt(stats.skipped_lines)}")
+    print(f"有效规则：{fmt(stats.recognized_rules)}")
+    print(f"重复规则：{fmt(stats.duplicates)}")
+    print(f"新增唯一：{fmt(stats.added_unique)}")
+    print(f"优先级替换：{fmt(stats.replaced_by_priority)}")
 
     if stats.kind_counter:
-        print("Rule kinds:")
-        for kind, count in stats.kind_counter.most_common():
-            print(f"  - {kind:<16} {fmt(count)}")
+        top = ", ".join(
+            f"{kind}={fmt(count)}"
+            for kind, count in stats.kind_counter.most_common(5)
+        )
+        print(f"主要类型：{top}")
 
-    print_line("=")
+    print_line()
     print()
 
 
 def print_summary(aggregator: SemanticAggregator, final_rules: List[Rule]):
     kind_counter = aggregator.merged_kind_counter(final_rules)
 
-    print_line("=")
-    print("📊 Merge Summary")
+    print_line()
+    print("聚合完成")
     print_line("-")
-    print(f"Raw lines total:          {fmt(aggregator.total_raw_lines())}")
-    print(f"Empty lines skipped:      {fmt(aggregator.total_empty_lines())}")
-    print(f"Comment lines skipped:    {fmt(aggregator.total_comment_lines())}")
-    print(f"Section lines skipped:    {fmt(aggregator.total_section_lines())}")
-    print(f"Recognized rules total:   {fmt(aggregator.total_recognized_rules())}")
-    print(f"Unknown kept total:       {fmt(aggregator.total_unknown_kept())}")
-    print(f"Structural duplicates:    {fmt(aggregator.total_structural_duplicates())}")
-    print(f"Unknown duplicates:       {fmt(aggregator.total_unknown_duplicates())}")
-    print(f"Replaced by priority:     {fmt(aggregator.total_replaced_by_priority())}")
-    print(f"Unique before contain:    {fmt(aggregator.total_rules())}")
-    print(f"Containment removed:      {fmt(aggregator.dropped_containment)}")
-    print(f"  - DOMAIN by suffix:     {fmt(aggregator.dropped_domain_by_suffix)}")
-    print(f"  - sub suffix by suffix: {fmt(aggregator.dropped_suffix_by_suffix)}")
-    print(f"  - CIDR by CIDR:         {fmt(aggregator.dropped_cidr_by_cidr)}")
-    print(f"Final rules:              {fmt(len(final_rules))}")
+    print(f"原始总行数：{fmt(aggregator.total_raw_lines())}")
+    print(f"跳过总行数：{fmt(aggregator.total_skipped_lines())}")
+    print(f"有效规则数：{fmt(aggregator.total_recognized_rules())}")
+    print(f"未知保留数：{fmt(aggregator.total_unknown_kept())}")
+    print(f"结构重复数：{fmt(aggregator.total_duplicates())}")
+    print(f"优先级替换：{fmt(aggregator.total_replaced_by_priority())}")
+    print(f"包含去重前：{fmt(aggregator.total_rules())}")
+    print(f"包含去重删除：{fmt(aggregator.dropped_containment)}")
+    print(f"  - DOMAIN 被后缀覆盖：{fmt(aggregator.dropped_domain_by_suffix)}")
+    print(f"  - 子后缀被大后缀覆盖：{fmt(aggregator.dropped_suffix_by_suffix)}")
+    print(f"  - 小网段被大网段覆盖：{fmt(aggregator.dropped_cidr_by_cidr)}")
+    print(f"最终输出规则：{fmt(len(final_rules))}")
 
     if kind_counter:
-        print("Final rule kinds:")
-        for kind, count in kind_counter.most_common():
-            print(f"  - {kind:<16} {fmt(count)}")
+        top = ", ".join(
+            f"{kind}={fmt(count)}"
+            for kind, count in kind_counter.most_common(8)
+        )
+        print(f"最终类型统计：{top}")
 
-    print_line("=")
+    print_line()
 
 
 def main():
@@ -541,38 +506,44 @@ def main():
     aggregator = SemanticAggregator(dedupe_cfg=dedupe_cfg)
 
     enabled_sources: List[Source] = []
+
     for item in cfg.get("sources", []):
         if not item.get("enabled", True):
             continue
+
         url = item.get("url", "").strip()
+
         if not url:
             continue
-        enabled_sources.append(Source(
-            name=item.get("name") or urlparse(url).netloc or "source",
-            priority=int(item.get("priority", 0)),
-            url=url,
-        ))
+
+        enabled_sources.append(
+            Source(
+                name=item.get("name") or urlparse(url).netloc or "source",
+                priority=int(item.get("priority", 0)),
+                url=url,
+            )
+        )
 
     if not enabled_sources:
-        print("No enabled sources. Please edit config/sources.json")
+        print("没有启用任何规则源，请检查 config/sources.json")
         return 1
 
-    print_line("=")
-    print("🚀 Loon Rule Aggregator")
+    print_line()
+    print("Loon 规则聚合器")
     print_line("-")
-    print(f"Enabled sources:          {len(enabled_sources)}")
-    print(f"Dedupe mode:              {dedupe_cfg.get('mode', 'semantic')}")
-    print(f"Containment dedupe:       {dedupe_cfg.get('containment', {}).get('enabled', False)}")
-    print_line("=")
+    print(f"启用规则源：{len(enabled_sources)}")
+    print(f"去重模式：{dedupe_cfg.get('mode', 'semantic')}")
+    print(f"包含去重：{dedupe_cfg.get('containment', {}).get('enabled', False)}")
+    print_line()
     print()
 
     for source in enabled_sources:
         try:
-            print(f"Fetching {source.name} ...")
+            print(f"正在拉取：{source.name}")
             text = fetch_url(source.url)
             aggregator.parse_text(text, source)
         except Exception as e:
-            print(f"[WARN] Failed to fetch/parse {source.name}: {e}", file=sys.stderr)
+            print(f"[警告] {source.name} 拉取或解析失败：{e}", file=sys.stderr)
 
     output_rel = plugin_cfg.get("output", "dist/merged-adblock.plugin")
     output_path = ROOT / output_rel
@@ -585,7 +556,7 @@ def main():
     print_summary(aggregator, final_rules)
 
     print()
-    print(f"✅ Done: {output_path}")
+    print(f"完成，输出文件：{output_path}")
     return 0
 
 

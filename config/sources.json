@@ -28,6 +28,22 @@
   },
   "china_domain": {
     "enabled": true,
+    "matching": {
+      "suffix_match": true,
+      "reverse_subdomain_match": true,
+      "min_reverse_domain_parts": 2,
+      "protected_suffixes": [
+        "com",
+        "net",
+        "org",
+        "cn",
+        "com.cn",
+        "net.cn",
+        "org.cn",
+        "edu.cn",
+        "gov.cn"
+      ]
+    },
     "sources": [
       {
         "name": "217heidai-china",

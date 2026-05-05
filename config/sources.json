@@ -26,17 +26,16 @@
   },
   "sources": [
     {
-      "name": "Kelee-AdvertisingLite",
-      "enabled": true,
-      "priority": 1,
-      "url": "https://rule.kelee.one/Loon/AdvertisingLite.lsr",
-      "user_agent": "Loon/3.2.0 CFNetwork/1496.0.7 Darwin/23.5.0"
-    },
-    {
       "name": "AWAvenue-Ads-Rule",
       "enabled": true,
-      "priority": 5,
+      "priority": 4,
       "url": "https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list"
+    },
+    {
+      "name": "Aethersailor-adblockloonlite",
+      "enabled": true,
+      "priority": 1,
+      "url": "https://raw.githubusercontent.com/Aethersailor/adblockfilters-modified/main/rules/adblockloonlite.list"
     },
     {
       "name": "anti-AD",
@@ -47,14 +46,8 @@
     {
       "name": "Cats-Team-AdRules",
       "enabled": true,
-      "priority": 4,
-      "url": "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules.list"
-    },
-    {
-      "name": "Aethersailor-adblockloonlite",
-      "enabled": true,
       "priority": 2,
-      "url": "https://raw.githubusercontent.com/Aethersailor/adblockfilters-modified/main/rules/adblockloonlite.list"
+      "url": "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules.list"
     }
   ]
 }

@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "sources.json"
 
 
+DEFAULT_USER_AGENT = "Loon/3.2.0 CFNetwork/1496.0.7 Darwin/23.5.0"
+
 REJECT_POLICIES = {
     "REJECT",
     "REJECT-DROP",
@@ -27,6 +29,7 @@ class Source:
     name: str
     priority: int
     url: str
+    user_agent: str = ""
 
 
 @dataclass
@@ -46,8 +49,6 @@ class Rule:
         policy = normalize_policy(self.policy)
         target = normalize_target_by_kind(kind, self.target)
 
-        # 广告拦截规则里，REJECT / REJECT-DROP / REJECT-NO-DROP 视为同一类；
-        # REJECT 类规则去重时忽略 no-resolve 等尾部参数。
         if policy == "REJECT":
             options = ()
         else:
@@ -205,21 +206,18 @@ class SemanticAggregator:
 
         suffix_set = {host for host, _ in suffix_rules}
 
-        # DOMAIN-SUFFIX 覆盖 DOMAIN
         if cfg.get("domain_suffix_contains_domain", True):
             for host, r in domain_rules:
                 if has_covering_suffix(host, suffix_set):
                     remove_ids.add(id(r))
                     self.dropped_domain_by_suffix += 1
 
-        # DOMAIN-SUFFIX 覆盖更深的 DOMAIN-SUFFIX
         if cfg.get("domain_suffix_contains_sub_suffix", True):
             for host, r in suffix_rules:
                 if has_parent_suffix(host, suffix_set):
                     remove_ids.add(id(r))
                     self.dropped_suffix_by_suffix += 1
 
-        # IP-CIDR 大网段覆盖小网段
         if cfg.get("ip_cidr_contains", True):
             cidr_rules = [
                 r for r in rules
@@ -295,14 +293,6 @@ class SemanticAggregator:
         return sum(s.replaced_by_priority for s in self.source_stats)
 
     def render(self, plugin_cfg: dict) -> str:
-        """
-        输出纯规则 list，不输出 plugin 头，也不输出 [Rule]。
-
-        适用于：
-        - Loon filter_remote
-        - Surge RULE-SET
-        - 普通 .list 规则订阅
-        """
         rules = self.all_rules()
         kind_counter = self.merged_kind_counter(rules)
 
@@ -493,8 +483,13 @@ def has_covering_suffix(domain: str, suffix_set: set) -> bool:
     return False
 
 
-def fetch_url(url: str) -> str:
-    headers = {"User-Agent": "loon-rule-aggregator/1.0"}
+def fetch_url(url: str, user_agent: str = "") -> str:
+    headers = {
+        "User-Agent": user_agent or DEFAULT_USER_AGENT,
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+
     resp = requests.get(url, headers=headers, timeout=45)
     resp.raise_for_status()
     resp.encoding = resp.encoding or "utf-8"
@@ -587,6 +582,7 @@ def main():
                 name=item.get("name") or urlparse(url).netloc or "source",
                 priority=int(item.get("priority", 0)),
                 url=url,
+                user_agent=item.get("user_agent", ""),
             )
         )
 
@@ -606,7 +602,7 @@ def main():
     for source in enabled_sources:
         try:
             print(f"正在拉取：{source.name}")
-            text = fetch_url(source.url)
+            text = fetch_url(source.url, source.user_agent)
             aggregator.parse_text(text, source)
         except Exception as e:
             print(f"[警告] {source.name} 拉取或解析失败：{e}", file=sys.stderr)

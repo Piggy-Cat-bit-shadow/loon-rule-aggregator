@@ -70,6 +70,21 @@ class SourceStats:
     kind_counter: Counter = field(default_factory=Counter)
 
 
+@dataclass
+class ChinaSplitStats:
+    china_set_size: int = 0
+    total_rules: int = 0
+    checked_rules: int = 0
+    unsupported_rules: int = 0
+    cn_rules: int = 0
+    global_rules: int = 0
+    exact_matches: int = 0
+    suffix_matches: int = 0
+    kind_counter_cn: Counter = field(default_factory=Counter)
+    kind_counter_global: Counter = field(default_factory=Counter)
+    kind_counter_unsupported: Counter = field(default_factory=Counter)
+
+
 class SemanticAggregator:
     def __init__(self, dedupe_cfg: dict):
         self.dedupe_cfg = dedupe_cfg or {}
@@ -306,33 +321,31 @@ class SemanticAggregator:
         rules = self.all_rules()
         kind_counter = self.merged_kind_counter(rules)
 
-        out: List[str] = []
-
-        out.append("# 由 loon-rule-aggregator 自动生成")
-        out.append("# 类型：Loon / Surge 纯规则列表")
-        out.append("# 模式：语义去重，保留原始规则格式")
-        out.append("#")
-        out.append(f"# 原始总行数：{fmt(self.total_raw_lines())}")
-        out.append(f"# 跳过行数：{fmt(self.total_skipped_lines())}")
-        out.append(f"# 有效规则数：{fmt(self.total_recognized_rules())}")
-        out.append(f"# 未识别但保留：{fmt(self.total_unknown_kept())}")
-        out.append(f"# 结构重复数：{fmt(self.total_duplicates())}")
-        out.append(f"# 优先级替换数：{fmt(self.total_replaced_by_priority())}")
-        out.append(f"# 包含去重前：{fmt(self.total_rules())}")
-        out.append(f"# 包含去重删除：{fmt(self.dropped_containment)}")
-        out.append(f"# 最终规则数：{fmt(len(rules))}")
-        out.append("# 最终规则类型：")
+        header_lines = [
+            "# 由 loon-rule-aggregator 自动生成",
+            "# 类型：Loon / Surge 纯规则列表",
+            "# 模式：语义去重，保留原始规则格式",
+            "#",
+            f"# 原始总行数：{fmt(self.total_raw_lines())}",
+            f"# 跳过行数：{fmt(self.total_skipped_lines())}",
+            f"# 有效规则数：{fmt(self.total_recognized_rules())}",
+            f"# 未识别但保留：{fmt(self.total_unknown_kept())}",
+            f"# 结构重复数：{fmt(self.total_duplicates())}",
+            f"# 优先级替换数：{fmt(self.total_replaced_by_priority())}",
+            f"# 包含去重前：{fmt(self.total_rules())}",
+            f"# 包含去重删除：{fmt(self.dropped_containment)}",
+            f"# 最终规则数：{fmt(len(rules))}",
+            "# 最终规则类型：",
+        ]
 
         for kind, count in kind_counter.most_common():
-            out.append(f"# - {kind}: {fmt(count)}")
+            header_lines.append(f"# - {kind}: {fmt(count)}")
 
-        out.append("")
-
-        for r in sorted(rules, key=lambda x: x.order):
-            out.append(r.origin)
-
-        out.append("")
-        return "\n".join(out).rstrip() + "\n"
+        return render_list_file(
+            title="",
+            rules=rules,
+            header_lines=header_lines,
+        )
 
 
 def better(rule_candidate_priority: int, rule_candidate_order: int, old_priority: int, old_order: int) -> bool:
@@ -493,6 +506,153 @@ def has_covering_suffix(domain: str, suffix_set: set) -> bool:
     return False
 
 
+def parse_domain_from_rule(rule: Rule) -> str:
+    kind = rule.kind.upper()
+
+    if kind in {"DOMAIN", "DOMAIN-SUFFIX"}:
+        return normalize_domain(rule.target)
+
+    return ""
+
+
+def parse_china_domain_line(line: str) -> str:
+    line = line.strip()
+
+    if not line:
+        return ""
+
+    if line.startswith("#") or line.startswith("//") or line.startswith(";"):
+        return ""
+
+    if line.startswith("[") and line.endswith("]"):
+        return ""
+
+    parts = [p.strip() for p in line.split(",")]
+
+    # 支持 DOMAIN,xxx / DOMAIN-SUFFIX,xxx
+    if len(parts) >= 2 and parts[0].upper() in {"DOMAIN", "DOMAIN-SUFFIX"}:
+        return normalize_domain(parts[1])
+
+    # 支持纯域名
+    if "," not in line:
+        return normalize_domain(line)
+
+    return ""
+
+
+def load_china_domain_set(china_cfg: dict) -> set:
+    if not china_cfg or not china_cfg.get("enabled", False):
+        return set()
+
+    china_set = set()
+
+    for item in china_cfg.get("sources", []):
+        if not item.get("enabled", True):
+            continue
+
+        name = item.get("name", "china-source")
+        url = item.get("url", "").strip()
+
+        if not url:
+            continue
+
+        try:
+            print(f"正在拉取国内域名库：{name}")
+            text = fetch_url(url)
+
+            before = len(china_set)
+
+            for raw in text.splitlines():
+                domain = parse_china_domain_line(raw)
+                if domain:
+                    china_set.add(domain)
+
+            added = len(china_set) - before
+            print(f"国内域名库：{name}，新增 {fmt(added)} 条，累计 {fmt(len(china_set))} 条")
+
+        except Exception as e:
+            print(f"[警告] 国内域名库拉取失败：{name}，原因：{e}", file=sys.stderr)
+
+    return china_set
+
+
+def domain_match_china_set_with_reason(domain: str, china_set: set) -> Tuple[bool, str]:
+    domain = normalize_domain(domain)
+
+    if not domain:
+        return False, ""
+
+    if domain in china_set:
+        return True, "exact"
+
+    for parent in iter_parent_suffixes(domain):
+        if parent in china_set:
+            return True, "suffix"
+
+    return False, ""
+
+
+def split_cn_global_rules(rules: List[Rule], china_set: set) -> Tuple[List[Rule], List[Rule], ChinaSplitStats]:
+    cn_rules: List[Rule] = []
+    global_rules: List[Rule] = []
+
+    stats = ChinaSplitStats(
+        china_set_size=len(china_set),
+        total_rules=len(rules),
+    )
+
+    for r in rules:
+        kind = r.kind.upper()
+        domain = parse_domain_from_rule(r)
+
+        # 只有 DOMAIN / DOMAIN-SUFFIX 能比较准确判断国内归属
+        if not domain:
+            global_rules.append(r)
+            stats.unsupported_rules += 1
+            stats.kind_counter_unsupported[kind] += 1
+            stats.kind_counter_global[kind] += 1
+            continue
+
+        stats.checked_rules += 1
+
+        matched, reason = domain_match_china_set_with_reason(domain, china_set)
+
+        if matched:
+            cn_rules.append(r)
+            stats.cn_rules += 1
+            stats.kind_counter_cn[kind] += 1
+
+            if reason == "exact":
+                stats.exact_matches += 1
+            elif reason == "suffix":
+                stats.suffix_matches += 1
+        else:
+            global_rules.append(r)
+            stats.global_rules += 1
+            stats.kind_counter_global[kind] += 1
+
+    # global_rules 实际包含：未命中国内 + 不可判断规则
+    stats.global_rules = len(global_rules)
+
+    return cn_rules, global_rules, stats
+
+
+def render_list_file(title: str, rules: List[Rule], header_lines: List[str]) -> str:
+    out: List[str] = []
+
+    if title:
+        out.append(f"# {title}")
+
+    out.extend(header_lines)
+    out.append("")
+
+    for r in sorted(rules, key=lambda x: x.order):
+        out.append(r.origin)
+
+    out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
 def fetch_url(url: str) -> str:
     headers = {"User-Agent": "loon-rule-aggregator/1.0"}
     resp = requests.get(url, headers=headers, timeout=45)
@@ -564,6 +724,45 @@ def print_summary(aggregator: SemanticAggregator, final_rules: List[Rule]):
     print_line()
 
 
+def print_china_split_summary(stats: ChinaSplitStats, output_cn_path: Path, output_global_path: Path):
+    print_line()
+    print("国内 / 非国内规则拆分完成")
+    print_line("-")
+    print(f"国内域名库数量：        {fmt(stats.china_set_size)}")
+    print(f"全量规则数：            {fmt(stats.total_rules)}")
+    print(f"参与国内判断规则数：    {fmt(stats.checked_rules)}")
+    print(f"不可判断规则数：        {fmt(stats.unsupported_rules)}")
+    print(f"匹配国内规则数：        {fmt(stats.cn_rules)}")
+    print(f"  - 精确命中：          {fmt(stats.exact_matches)}")
+    print(f"  - 父域/后缀命中：     {fmt(stats.suffix_matches)}")
+    print(f"非国内规则数：          {fmt(stats.global_rules)}")
+
+    if stats.kind_counter_cn:
+        top_cn = ", ".join(
+            f"{kind}={fmt(count)}"
+            for kind, count in stats.kind_counter_cn.most_common(6)
+        )
+        print(f"国内规则类型：          {top_cn}")
+
+    if stats.kind_counter_global:
+        top_global = ", ".join(
+            f"{kind}={fmt(count)}"
+            for kind, count in stats.kind_counter_global.most_common(6)
+        )
+        print(f"非国内规则类型：        {top_global}")
+
+    if stats.kind_counter_unsupported:
+        top_unsupported = ", ".join(
+            f"{kind}={fmt(count)}"
+            for kind, count in stats.kind_counter_unsupported.most_common(6)
+        )
+        print(f"不可判断类型：          {top_unsupported}")
+
+    print(f"国内规则输出：          {output_cn_path}")
+    print(f"非国内规则输出：        {output_global_path}")
+    print_line()
+
+
 def main():
     cfg = load_config()
     plugin_cfg = cfg.get("plugin", {})
@@ -621,8 +820,49 @@ def main():
 
     print_summary(aggregator, final_rules)
 
+    # 国内 / 非国内拆分
+    china_cfg = cfg.get("china_domain", {})
+    china_set = load_china_domain_set(china_cfg)
+
+    if china_set:
+        cn_rules, global_rules, china_stats = split_cn_global_rules(final_rules, china_set)
+
+        output_cn_rel = plugin_cfg.get("output_cn", "dist/merged-adblock-cn.list")
+        output_global_rel = plugin_cfg.get("output_global", "dist/merged-adblock-global.list")
+
+        output_cn_path = ROOT / output_cn_rel
+        output_global_path = ROOT / output_global_rel
+
+        output_cn_path.parent.mkdir(parents=True, exist_ok=True)
+        output_global_path.parent.mkdir(parents=True, exist_ok=True)
+
+        header_lines = [
+            "# 由 loon-rule-aggregator 自动生成",
+            "# 类型：Loon / Surge 纯规则列表",
+            "# 模式：国内域名库匹配拆分",
+            f"# 国内域名库数量：{fmt(len(china_set))}",
+            f"# 全量规则数：{fmt(len(final_rules))}",
+            f"# 国内规则数：{fmt(len(cn_rules))}",
+            f"# 非国内规则数：{fmt(len(global_rules))}",
+            f"# 国内精确命中：{fmt(china_stats.exact_matches)}",
+            f"# 国内父域/后缀命中：{fmt(china_stats.suffix_matches)}",
+            f"# 不可判断规则数：{fmt(china_stats.unsupported_rules)}",
+        ]
+
+        output_cn_path.write_text(
+            render_list_file("Merged Loon AdBlock CN List", cn_rules, header_lines),
+            encoding="utf-8",
+        )
+
+        output_global_path.write_text(
+            render_list_file("Merged Loon AdBlock Global List", global_rules, header_lines),
+            encoding="utf-8",
+        )
+
+        print_china_split_summary(china_stats, output_cn_path, output_global_path)
+
     print()
-    print(f"完成，输出文件：{output_path}")
+    print(f"完成，全量输出文件：{output_path}")
     return 0
 
 

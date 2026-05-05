@@ -15,6 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config" / "sources.json"
 
 
+REJECT_POLICIES = {
+    "REJECT",
+    "REJECT-DROP",
+    "REJECT-NO-DROP",
+}
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
@@ -35,12 +42,24 @@ class Rule:
 
     @property
     def structural_key(self) -> Tuple[str, str, str, Tuple[str, ...]]:
-        return (
-            self.kind.upper(),
-            normalize_target(self.target),
-            self.policy.upper(),
-            tuple(x.lower() for x in self.options),
-        )
+        """
+        结构去重 key。
+
+        优化点：
+        1. REJECT / REJECT-DROP / REJECT-NO-DROP 统一视为 REJECT 类；
+        2. REJECT 类规则去重时忽略 no-resolve 等尾部参数；
+        3. DOMAIN / DOMAIN-SUFFIX / IP-CIDR 目标做规范化。
+        """
+        kind = self.kind.upper()
+        policy = normalize_policy(self.policy)
+        target = normalize_target_by_kind(kind, self.target)
+
+        if policy == "REJECT":
+            options = ()
+        else:
+            options = tuple(x.lower().strip() for x in self.options)
+
+        return kind, target, policy, options
 
 
 @dataclass
@@ -70,6 +89,8 @@ class SemanticAggregator:
         self.dropped_domain_by_suffix = 0
         self.dropped_suffix_by_suffix = 0
         self.dropped_cidr_by_cidr = 0
+
+        self._cached_final_rules: Optional[List[Rule]] = None
 
     def parse_text(self, text: str, source: Source):
         stats = SourceStats(name=source.name, url=source.url)
@@ -140,96 +161,119 @@ class SemanticAggregator:
         after = self.total_rules()
         stats.added_unique = after - before
         self.source_stats.append(stats)
+        self._cached_final_rules = None
         print_source_stats(stats)
 
     def total_rules(self) -> int:
         return len(self.rules_by_key) + len(self.unknown_by_key)
 
     def all_rules(self) -> List[Rule]:
+        if self._cached_final_rules is not None:
+            return self._cached_final_rules
+
         rules = list(self.rules_by_key.values()) + list(self.unknown_by_key.values())
 
         if self.dedupe_cfg.get("containment", {}).get("enabled", False):
             rules = self.apply_containment_dedupe(rules)
 
+        self._cached_final_rules = rules
         return rules
 
     def apply_containment_dedupe(self, rules: List[Rule]) -> List[Rule]:
+        self.dropped_containment = 0
+        self.dropped_domain_by_suffix = 0
+        self.dropped_suffix_by_suffix = 0
+        self.dropped_cidr_by_cidr = 0
+
         cfg = self.dedupe_cfg.get("containment", {})
         remove_ids = set()
 
-        domain_suffix_rules = [
-            r for r in rules
-            if r.kind.upper() == "DOMAIN-SUFFIX" and r.policy.upper().startswith("REJECT")
-        ]
-        domain_rules = [
-            r for r in rules
-            if r.kind.upper() == "DOMAIN" and r.policy.upper().startswith("REJECT")
-        ]
+        suffix_rules: List[Tuple[str, Rule]] = []
+        domain_rules: List[Tuple[str, Rule]] = []
 
-        suffixes = []
-        for r in domain_suffix_rules:
-            host = normalize_domain(r.target)
-            if host:
-                suffixes.append((host, r))
+        for r in rules:
+            kind = r.kind.upper()
+            policy = normalize_policy(r.policy)
 
-        if cfg.get("domain_suffix_contains_domain", True):
-            for r in domain_rules:
+            if policy != "REJECT":
+                continue
+
+            if kind == "DOMAIN-SUFFIX":
                 host = normalize_domain(r.target)
-                if not host:
-                    continue
+                if host:
+                    suffix_rules.append((host, r))
 
-                if find_covering_suffix(host, suffixes) is not None:
-                    if id(r) not in remove_ids:
-                        self.dropped_domain_by_suffix += 1
+            elif kind == "DOMAIN":
+                host = normalize_domain(r.target)
+                if host:
+                    domain_rules.append((host, r))
+
+        suffix_set = {host for host, _ in suffix_rules}
+
+        # DOMAIN-SUFFIX 覆盖 DOMAIN
+        if cfg.get("domain_suffix_contains_domain", True):
+            for host, r in domain_rules:
+                if has_covering_suffix(host, suffix_set):
                     remove_ids.add(id(r))
+                    self.dropped_domain_by_suffix += 1
 
+        # DOMAIN-SUFFIX 覆盖更深的 DOMAIN-SUFFIX
         if cfg.get("domain_suffix_contains_sub_suffix", True):
-            sorted_suffixes = sorted(suffixes, key=lambda x: suffix_depth(x[0]))
+            for host, r in suffix_rules:
+                if has_parent_suffix(host, suffix_set):
+                    remove_ids.add(id(r))
+                    self.dropped_suffix_by_suffix += 1
 
-            for host, r in sorted_suffixes:
-                for parent, parent_rule in sorted_suffixes:
-                    if id(parent_rule) == id(r):
-                        continue
-                    if suffix_depth(parent) >= suffix_depth(host):
-                        continue
-                    if domain_is_under(host, parent):
-                        if id(r) not in remove_ids:
-                            self.dropped_suffix_by_suffix += 1
-                        remove_ids.add(id(r))
-                        break
-
+        # IP-CIDR 大网段覆盖小网段
         if cfg.get("ip_cidr_contains", True):
             cidr_rules = [
                 r for r in rules
                 if r.kind.upper() in {"IP-CIDR", "IP-CIDR6"}
-                and r.policy.upper().startswith("REJECT")
+                and normalize_policy(r.policy) == "REJECT"
             ]
 
-            networks: List[Tuple[ipaddress._BaseNetwork, Rule]] = []
+            networks_v4: List[Tuple[ipaddress._BaseNetwork, Rule]] = []
+            networks_v6: List[Tuple[ipaddress._BaseNetwork, Rule]] = []
+
             for r in cidr_rules:
                 try:
-                    networks.append((ipaddress.ip_network(r.target, strict=False), r))
+                    net = ipaddress.ip_network(r.target, strict=False)
+                    if net.version == 4:
+                        networks_v4.append((net, r))
+                    else:
+                        networks_v6.append((net, r))
                 except Exception:
                     pass
 
-            networks.sort(key=lambda x: (x[0].version, x[0].prefixlen))
-
-            for net, r in networks:
-                for parent_net, parent_rule in networks:
-                    if id(parent_rule) == id(r):
-                        continue
-                    if parent_net.version != net.version:
-                        continue
-                    if parent_net.prefixlen >= net.prefixlen:
-                        continue
-                    if net.subnet_of(parent_net):
-                        if id(r) not in remove_ids:
-                            self.dropped_cidr_by_cidr += 1
-                        remove_ids.add(id(r))
-                        break
+            self._mark_covered_cidr(networks_v4, remove_ids)
+            self._mark_covered_cidr(networks_v6, remove_ids)
 
         self.dropped_containment = len(remove_ids)
         return [r for r in rules if id(r) not in remove_ids]
+
+    def _mark_covered_cidr(self, networks: List[Tuple[ipaddress._BaseNetwork, Rule]], remove_ids: set):
+        networks.sort(key=lambda x: x[0].prefixlen)
+
+        parents: List[Tuple[ipaddress._BaseNetwork, Rule]] = []
+
+        for net, r in networks:
+            covered = False
+
+            for parent_net, parent_rule in parents:
+                if id(parent_rule) == id(r):
+                    continue
+                if parent_net.prefixlen >= net.prefixlen:
+                    continue
+                if net.subnet_of(parent_net):
+                    covered = True
+                    break
+
+            if covered:
+                if id(r) not in remove_ids:
+                    remove_ids.add(id(r))
+                    self.dropped_cidr_by_cidr += 1
+            else:
+                parents.append((net, r))
 
     def merged_kind_counter(self, rules: List[Rule]) -> Counter:
         counter = Counter()
@@ -374,6 +418,30 @@ def parse_rule_line(line: str, source_name: str, priority: int, order: int) -> O
     )
 
 
+def normalize_policy(policy: str) -> str:
+    p = policy.strip().upper()
+
+    if p in REJECT_POLICIES:
+        return "REJECT"
+
+    return p
+
+
+def normalize_target_by_kind(kind: str, target: str) -> str:
+    kind = kind.upper()
+
+    if kind in {"DOMAIN", "DOMAIN-SUFFIX"}:
+        return normalize_domain(target)
+
+    if kind in {"IP-CIDR", "IP-CIDR6"}:
+        try:
+            return str(ipaddress.ip_network(target, strict=False))
+        except Exception:
+            return target.strip().lower()
+
+    return normalize_target(target)
+
+
 def text_key(line: str) -> str:
     normalized = line.strip()
     normalized = re.sub(r"\s*,\s*", ",", normalized)
@@ -391,8 +459,11 @@ def normalize_target(target: str) -> str:
 
 
 def normalize_domain(domain: str) -> str:
-    d = domain.strip().lower().rstrip(".")
-    d = d.lstrip("*.").lstrip(".")
+    d = domain.strip().lower()
+    d = d.rstrip(".")
+    d = d.lstrip("*.")
+    d = d.lstrip(".")
+    d = re.sub(r"\.+", ".", d)
 
     if not d or "/" in d or ":" in d:
         return ""
@@ -414,17 +485,49 @@ def domain_is_under(child: str, parent: str) -> bool:
     return child == parent or child.endswith("." + parent)
 
 
-def find_covering_suffix(host: str, suffixes: List[Tuple[str, Rule]]) -> Optional[Rule]:
-    host = normalize_domain(host)
+def iter_parent_suffixes(domain: str):
+    parts = normalize_domain(domain).split(".")
 
-    if not host:
-        return None
+    for i in range(1, len(parts)):
+        yield ".".join(parts[i:])
 
-    for suffix, rule in suffixes:
-        if domain_is_under(host, suffix):
-            return rule
 
-    return None
+def has_parent_suffix(domain: str, suffix_set: set) -> bool:
+    """
+    用于 DOMAIN-SUFFIX 覆盖子 DOMAIN-SUFFIX。
+
+    example:
+    suffix_set 有 example.com
+    当前是 ads.example.com
+    则 ads.example.com 被 example.com 覆盖。
+    """
+    domain = normalize_domain(domain)
+
+    for parent in iter_parent_suffixes(domain):
+        if parent in suffix_set:
+            return True
+
+    return False
+
+
+def has_covering_suffix(domain: str, suffix_set: set) -> bool:
+    """
+    用于 DOMAIN-SUFFIX 覆盖 DOMAIN。
+
+    DOMAIN,ads.example.com
+    如果 suffix_set 中有 ads.example.com 或 example.com
+    都可以覆盖它。
+    """
+    domain = normalize_domain(domain)
+
+    if domain in suffix_set:
+        return True
+
+    for parent in iter_parent_suffixes(domain):
+        if parent in suffix_set:
+            return True
+
+    return False
 
 
 def fetch_url(url: str) -> str:
@@ -549,10 +652,10 @@ def main():
     output_path = ROOT / output_rel
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    final_rules = aggregator.all_rules()
     rendered = aggregator.render(plugin_cfg)
     output_path.write_text(rendered, encoding="utf-8")
 
-    final_rules = aggregator.all_rules()
     print_summary(aggregator, final_rules)
 
     print()

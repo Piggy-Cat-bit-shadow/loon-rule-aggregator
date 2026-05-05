@@ -33,7 +33,7 @@
     },
     {
       "name": "Aethersailor-adblockloonlite",
-      "enabled": true,
+      "enabled": false,
       "priority": 1,
       "url": "https://raw.githubusercontent.com/Aethersailor/adblockfilters-modified/main/rules/adblockloonlite.list"
     },

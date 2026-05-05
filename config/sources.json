@@ -1,0 +1,54 @@
+{
+  "plugin": {
+    "name": "Merged Loon AdBlock",
+    "desc": "聚合多个已符合 Loon/Surge 规则格式的广告规则源，保留原格式，支持结构去重和可选包含去重",
+    "author": "Piggy-Cat-bit-shadow",
+    "homepage": "https://github.com/Piggy-Cat-bit-shadow/loon-rule-aggregator",
+    "icon": "https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Advertising.png",
+    "output": "dist/merged-adblock.plugin"
+  },
+  "dedupe": {
+    "mode": "semantic",
+    "description": "semantic = 内部解析成规则对象去重，但输出仍保留原始 Loon/Surge 规则格式。",
+    "priority_note": "priority 数字越大，重复规则冲突时越优先保留。默认使用 5/4/3/2。",
+    "structural": {
+      "enabled": true,
+      "description": "同类型、同目标、同策略、同参数的规则视为重复；保留 priority 更高的原始写法。"
+    },
+    "containment": {
+      "enabled": true,
+      "description": "激进包含去重：保留覆盖范围更大的 DOMAIN-SUFFIX / IP-CIDR，删除被覆盖的小规则。",
+      "domain_suffix_contains_domain": true,
+      "domain_suffix_contains_sub_suffix": true,
+      "ip_cidr_contains": true,
+      "domain_keyword_contains": false,
+      "url_regex_contains": false
+    }
+  },
+  "sources": [
+    {
+      "name": "AWAvenue-Ads-Rule",
+      "enabled": true,
+      "priority": 5,
+      "url": "https://raw.githubusercontent.com/TG-Twilight/AWAvenue-Ads-Rule/main/Filters/AWAvenue-Ads-Rule-Surge-RULE-SET.list"
+    },
+    {
+      "name": "Aethersailor-adblockloonlite",
+      "enabled": true,
+      "priority": 4,
+      "url": "https://raw.githubusercontent.com/Aethersailor/adblockfilters-modified/main/rules/adblockloonlite.list"
+    },
+    {
+      "name": "anti-AD-surge2",
+      "enabled": true,
+      "priority": 3,
+      "url": "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-surge2.txt"
+    },
+    {
+      "name": "Cats-Team-AdRules",
+      "enabled": true,
+      "priority": 2,
+      "url": "https://raw.githubusercontent.com/Cats-Team/AdRules/main/adrules.list"
+    }
+  ]
+}
